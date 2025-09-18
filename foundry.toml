@@ -1,7 +1,15 @@
 [profile.default]
 src = "src"
 out = "out"
-libs = ["lib"]
+libs = ["lib", "lib/chainlink-ccip/chains/evm", "lib/chainlink-local", "lib/chainlink-local/lib/chainlink-evm"]
+remappings = [
+  "@chainlink/contracts/src/v0.8/vendor/openzeppelin-solidity/v5.0.2/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@chainlink/contracts/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@chainlink/contracts/src/v0.8/shared/=lib/chainlink-local/lib/chainlink-evm/contracts/src/v0.8/shared/",
+  "@chainlink/contracts/src/v0.8/=lib/chainlink-local/lib/chainlink-evm/contracts/src/v0.8/",
+  "@chainlink/contracts/=node_modules/@chainlink/contracts/",
+  "@openzeppelin/=lib/openzeppelin-contracts/",
+]
 
 
 [lint]

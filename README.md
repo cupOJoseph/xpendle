@@ -24,6 +24,9 @@ Token and vault contract for institutional grade vePENDLE liquid staking.
 - **Liquidity and epochs**:
   - `startFirstEpoch()`: locks the vault’s entire PENDLE balance for the initial epoch.
   - `startNewEpoch()`: withdraws matured vePENDLE, computes assets reserved for pending redemptions at the snapshot rate (clamped to unlocked), and re‑locks the remainder for `epochDuration`.
+- **Deposits**:
+  - Before the first epoch: use `depositBeforeFirstEpoch(assets, receiver)`. Shares mint 1:1 against assets and are not locked until `startFirstEpoch()` is called.
+  - After the first epoch has started: use `deposit(assets, receiver)`. Deposited assets increase AUM and are locked immediately (subject to current epoch locking logic).
 - **Fees**: `claimFees(totalAccrued, proof)` increases AUM (no share mint). If the redemption window is closed, the vault may lock all currently unlocked PENDLE except what’s needed to honor reserved redemptions.
 - **Observability**: `getUserAvailableRedemption(address)`, `getTotalRequestedRedemptionAmountPerEpoch(uint256)`, `redemptionUsersForEpoch(uint256)`, `getAvailableRedemptionAmount()` (unlocked PENDLE balance), `previewVeWithdraw()`, and `previewRedeemWithCurrentValues(uint256)`.
 **⚠️ Important Limitations**

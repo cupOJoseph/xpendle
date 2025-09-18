@@ -10,8 +10,13 @@ import {FixedPointMathLib} from "lib/solady/src/utils/FixedPointMathLib.sol";
 import {IPMerkleDistributor} from "src/interfaces/pendle/IPMerkleDistributor.sol";
 import {IPVotingEscrowMainchain} from "src/interfaces/pendle/IPVotingEscrowMainchain.sol";
 import {IPVotingController} from "src/interfaces/pendle/IPVotingController.sol";
-
+import {ISTPENDLECrossChain} from "src/interfaces/ISTPENDLECrossChain.sol";
 import {ISTPENDLE} from "src/interfaces/ISTPENDLE.sol";
+
+// cross chain
+import {CCIPReceiver} from "lib/chainlink-ccip/chains/evm/contracts/applications/CCIPReceiver.sol";
+import {Client} from "lib/chainlink-ccip/chains/evm/contracts/libraries/Client.sol";
+import {IRouterClient} from "lib/chainlink-ccip/chains/evm/contracts/interfaces/IRouterClient.sol";
 // import "forge-std/console.sol";
 /**
  * @title stPENDLE - ERC-4626 Vault for PENDLE Staking
@@ -19,12 +24,14 @@ import {ISTPENDLE} from "src/interfaces/ISTPENDLE.sol";
  * @dev Fully compliant with ERC-4626 tokenized vault standard using Solady
  */
 
-contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
+contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE, ISTPENDLECrossChain, CCIPReceiver {
     using SafeTransferLib for address;
     using FixedPointMathLib for uint256;
 
     uint256 public constant ADMIN_ROLE = _ROLE_0;
     uint256 public constant TIMELOCK_CONTROLLER_ROLE = _ROLE_1;
+
+    uint256 public constant FEE_BASIS_POINTS = 1e18; // 1e18 = 100%
 
     // interfaces
     IPMerkleDistributor public merkleDistributor;
@@ -33,11 +40,15 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
 
     address public immutable ASSET;
     // settings
-    bool public feeSwitchIsEnabled = false;
-    uint256 public feeBasisPoints = 0;
     address public feeReceiver;
     bool public paused = false;
-    uint256 public rewardsSplit = 0;
+
+    // Fee split using 1e18 precision (holders + LP + protocol <= 1e18)
+    uint256 public rewardsSplitHolders; // default: 100% to holders (AUM)
+    uint256 public rewardsSplitLp;
+
+    uint256 public rewardsSplitProtocolX18 = 0;
+    address public lpFeeReceiver;
 
     // Epoch management
 
@@ -49,8 +60,12 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
     mapping(address user => mapping(uint256 epoch => uint256 pendingRedemptionAmount)) public
         pendingRedemptionSharesPerEpoch;
     mapping(uint256 epoch => uint256 totalPendingRedemptions) public totalPendingSharesPerEpoch;
-    mapping(uint256 epoch => address[] requestedUserRedemptions) public redemptionUsersPerEpoch;
     mapping(uint256 epoch => RedemptionSnapshot redemptionSnapshot) public redemptionSnapshotPerEpoch;
+
+    // cross chain
+    mapping(uint64 chainId => address crossChainGateway) public crossChainGatewayByChainId;
+    mapping(uint64 chainId => bytes extraArgs) public extraArgsByChainId;
+    address public feeToken;
 
     modifier whenNotPaused() {
         _whenNotPaused();
@@ -58,31 +73,39 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
     }
 
     modifier beforeFirstEpoch() {
-        if (_vaultPosition.currentEpoch != 0) revert InvalidEpoch();
+        _beforeFirstEpoch();
         _;
     }
 
-    constructor(
-        address _pendleTokenAddress,
-        address _merkleDistributorAddress,
-        address _votingEscrowMainchain,
-        address _votingControllerAddress,
-        address _timelockController,
-        address _admin,
-        uint256 _preLockRedemptionPeriod,
-        uint256 _epochDuration
-    ) {
-        votingEscrowMainchain = IPVotingEscrowMainchain(_votingEscrowMainchain);
-        merkleDistributor = IPMerkleDistributor(_merkleDistributorAddress);
-        votingController = IPVotingController(_votingControllerAddress);
-        ASSET = _pendleTokenAddress;
-        _vaultPosition.preLockRedemptionPeriod = _preLockRedemptionPeriod;
-        _vaultPosition.epochDuration = _safeCast128(_epochDuration);
+    constructor(VaultConfig memory config) CCIPReceiver(config.ccipRouter) {
+        if (config.lpFeeReceiver == address(0)) revert InvalidFeeReceiver();
+        if (config.feeReceiver == address(0)) revert InvalidFeeReceiver();
+        if (config.admin == address(0)) revert InvalidAdmin();
+        if (config.timelockController == address(0)) revert InvalidTimelockController();
+        if (config.pendleTokenAddress == address(0)) revert InvalidPendleToken();
+        if (config.merkleDistributorAddress == address(0)) revert InvalidMerkleDistributor();
+        if (config.votingEscrowMainchain == address(0)) revert InvalidVotingEscrowMainchain();
+        if (config.votingControllerAddress == address(0)) revert InvalidVotingController();
+        if (config.preLockRedemptionPeriod == 0) revert InvalidPreLockRedemptionPeriod();
+        if (config.epochDuration == 0) revert InvalidEpochDuration();
+        if (config.ccipRouter == address(0)) revert InvalidCCIPRouter();
+
+        votingEscrowMainchain = IPVotingEscrowMainchain(config.votingEscrowMainchain);
+        merkleDistributor = IPMerkleDistributor(config.merkleDistributorAddress);
+        votingController = IPVotingController(config.votingControllerAddress);
+        ASSET = config.pendleTokenAddress;
+        _vaultPosition.preLockRedemptionPeriod = config.preLockRedemptionPeriod;
+        _vaultPosition.epochDuration = _safeCast128(config.epochDuration);
+        rewardsSplitHolders = 9e17; // 90% to holders (AUM)
+        rewardsSplitLp = 1e17; // 10% to LP
+        lpFeeReceiver = config.lpFeeReceiver;
+        feeReceiver = config.feeReceiver;
+        feeToken = config.feeToken;
 
         _initializeOwner(address(msg.sender));
-        _grantRoles(_admin, ADMIN_ROLE);
-        _grantRoles(_timelockController, TIMELOCK_CONTROLLER_ROLE);
-        transferOwnership(_admin);
+        _grantRoles(config.admin, ADMIN_ROLE);
+        _grantRoles(config.timelockController, TIMELOCK_CONTROLLER_ROLE);
+        transferOwnership(config.admin);
     }
 
     /// @dev Returns the address of the underlying asset
@@ -98,6 +121,20 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         _lockPendle(amount, 0);
 
         return sharesMinted;
+    }
+
+    function depositAndBridge(uint64 destChainId, address receiver, uint256 amount)
+        public
+        whenNotPaused
+        returns (uint256, bytes32)
+    {
+        uint256 sharesMinted = super.deposit(amount, receiver);
+        _vaultPosition.aumPendle += amount;
+        // increase lock position in vePENDLE
+        _lockPendle(amount, 0);
+        // bridge to destination chain
+        bytes32 messageId = _bridgeStPendle(destChainId, receiver, amount);
+        return (sharesMinted, messageId);
     }
 
     /**
@@ -130,19 +167,32 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         if (totalAccrued == 0) revert InvalidAmount();
         // will revert if proof or totalAccrued is invalid
         uint256 amountClaimed = merkleDistributor.claim(address(this), totalAccrued, proof);
-        _vaultPosition.aumPendle += amountClaimed;
         emit FeesClaimed(amountClaimed, block.timestamp);
 
-        // If redemption window has closed, lock all currently unlocked PENDLE
-        uint256 amountToLock = amountClaimed;
-        if (!_isWithinRedemptionWindow()) {
-            // get current pendle required to cover redemptions
-            uint256 totalPendingRedemptions = totalPendingSharesPerEpoch[_vaultPosition.currentEpoch];
-            uint256 totalPendingRedemptionsInAssets = convertToAssets(totalPendingRedemptions);
-            amountToLock = _vaultPosition.aumPendle - totalPendingRedemptionsInAssets;
+        // Split fees (1e18 precision): holders (AUM), LP (transfer), protocol (transfer)
+        uint256 holdersAmount = FixedPointMathLib.fullMulDiv(amountClaimed, rewardsSplitHolders, FEE_BASIS_POINTS);
+        uint256 lpAmount = FixedPointMathLib.fullMulDiv(amountClaimed, rewardsSplitLp, FEE_BASIS_POINTS);
+        uint256 protocolAmount = amountClaimed - holdersAmount - lpAmount; // remainder to protocol
+
+        if (holdersAmount != 0) {
+            _vaultPosition.aumPendle += holdersAmount;
         }
 
-        if (amountToLock > 0) {
+        if (lpAmount != 0) {
+            SafeTransferLib.safeTransfer(asset(), lpFeeReceiver, lpAmount);
+        }
+
+        if (protocolAmount != 0) {
+            SafeTransferLib.safeTransfer(asset(), feeReceiver, protocolAmount);
+        }
+
+        // Lock behavior
+        uint256 amountToLock = holdersAmount; // lock the portion kept by holders by default
+        if (!_isWithinRedemptionWindow()) {
+            // Lock all currently unlocked PENDLE
+            amountToLock = SafeTransferLib.balanceOf(asset(), address(this));
+        }
+        if (amountToLock != 0) {
             _lockPendle(amountToLock, 0);
         }
     }
@@ -170,6 +220,8 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
     function startNewEpoch() external whenNotPaused nonReentrant {
         _requireNextEpoch();
         uint256 newEpoch = _updateEpoch();
+        // check that there is a vePENDLE to claim
+        if (votingEscrowMainchain.balanceOf(address(this)) == 0) revert InsufficientBalance();
 
         // 1) Claim matured vePENDLE
         uint256(votingEscrowMainchain.withdraw());
@@ -177,19 +229,20 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
 
         uint256 totalPendleBalance = SafeTransferLib.balanceOf(address(asset()), address(this));
 
-        // 2) Reserve assets for redemptions in the new epoch
+        // 2) Snapshot and reserve using virtual shares math
+        uint256 aumAtStart = _vaultPosition.aumPendle;
+        uint256 supplyAtStart = totalSupply();
         uint256 pendingShares = totalPendingSharesPerEpoch[newEpoch]; // tracked in shares
         uint256 reserveAssets = 0;
-        if (pendingShares != 0) {
-            // 1:1 semantics: reserve exactly the pending shares (clamped)
-            reserveAssets = convertToAssets(pendingShares);
+        if (pendingShares != 0 && supplyAtStart != 0) {
+            reserveAssets = FixedPointMathLib.fullMulDiv(pendingShares, aumAtStart + 1, supplyAtStart + 1);
             if (reserveAssets > totalPendleBalance) reserveAssets = totalPendleBalance; // clamp
-            if (totalPendleBalance != _vaultPosition.aumPendle) revert InvalidPendleBalance();
         }
+
         // snapshot the redemption state
         RedemptionSnapshot memory redemptionSnapshot = RedemptionSnapshot({
-            aumPendleAtEpochStart: _vaultPosition.aumPendle,
-            totalSupplyAtEpochStart: totalSupply(),
+            aumPendleAtEpochStart: aumAtStart,
+            totalSupplyAtEpochStart: supplyAtStart,
             reservedAssetsAtEpochStart: reserveAssets,
             epochStartTimestamp: block.timestamp
         });
@@ -224,9 +277,6 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         pendingRedemptionSharesPerEpoch[msg.sender][requestedEpoch] += shares;
         totalPendingSharesPerEpoch[requestedEpoch] += shares;
 
-        // Add to redemption users for requested epoch
-        redemptionUsersPerEpoch[requestedEpoch].push(msg.sender);
-
         emit RedemptionRequested(msg.sender, shares, requestedEpoch);
     }
 
@@ -243,6 +293,51 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         return _processRedemption(msg.sender, shares);
     }
 
+    /**
+     * @notice Bridge stPENDLE to destination chain
+     * @param destChainId Destination chain ID
+     * @param receiver Receiver address on destination chain
+     * @param amount Amount of stPENDLE to bridge
+     * @return messageId Message ID
+     */
+    function bridgeStPendle(uint64 destChainId, address receiver, uint256 amount) external returns (bytes32) {
+        return _bridgeStPendle(destChainId, receiver, amount);
+    }
+
+    function _bridgeStPendle(uint64 destChainId, address receiver, uint256 amount) internal returns (bytes32) {
+        if (amount > balanceOf(msg.sender)) revert InsufficientBalance();
+        if (destChainId == 0) revert InvalidDestChainId();
+        if (crossChainGatewayByChainId[destChainId] == address(0)) revert InvalidCrossChainGateway();
+        if (amount == 0) revert InvalidAmount();
+
+        // lock shares in this contract
+        SafeTransferLib.safeTransferFrom(address(this), msg.sender, address(this), amount);
+
+        Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](0);
+
+        Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
+            receiver: abi.encode(crossChainGatewayByChainId[destChainId]),
+            extraArgs: extraArgsByChainId[destChainId],
+            feeToken: feeToken,
+            tokenAmounts: tokenAmounts,
+            data: abi.encode(BridgeStPendleData({receiver: receiver, sender: msg.sender, amount: amount}))
+        });
+
+        uint256 fee = IRouterClient(i_ccipRouter).getFee(destChainId, message);
+        bytes32 messageId;
+
+        if (feeToken == address(0)) {
+            if (address(this).balance < fee) revert InsufficientBalance();
+            messageId = IRouterClient(i_ccipRouter).ccipSend{value: fee}(destChainId, message);
+        } else {
+            if (SafeTransferLib.balanceOf(feeToken, msg.sender) < fee) revert InsufficientBalance();
+            messageId = IRouterClient(i_ccipRouter).ccipSend(destChainId, message);
+        }
+
+        emit MessageSent(messageId);
+        return messageId;
+    }
+
     /// ============ View Functions ================ ///
 
     function name() public pure override returns (string memory) {
@@ -254,17 +349,10 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
     }
 
     /**
-     * @notice Preview the amount of PENDLE that can be withdrawn immediately from the pendle voting escrow vault position must be expired
-     * @return Amount available for redemption
+     * @notice Get the total requested redemption amount for the given epoch
+     * @param epoch Epoch to get the total requested redemption amount for
+     * @return Total requested redemption amount for the given epoch
      */
-    function previewVeWithdraw() public view returns (uint256) {
-        if (block.timestamp - _vaultPosition.lastEpochUpdate < _vaultPosition.epochDuration) return 0;
-
-        (bool success, bytes memory data) =
-            address(votingEscrowMainchain).staticcall(abi.encodeWithSelector(votingEscrowMainchain.withdraw.selector));
-        return success ? abi.decode(data, (uint128)) : 0;
-    }
-
     function getTotalRequestedRedemptionAmountPerEpoch(uint256 epoch) external view returns (uint256) {
         return _getTotalRequestedRedemptionAmountPerEpoch(epoch);
     }
@@ -292,18 +380,17 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
     }
 
     /**
-     * @notice Get all users who have requested redemption for an epoch
-     * @param epoch Epoch to get redemption users for
-     * @return Array of users who have requested redemption for the epoch
+     * @notice Get the current epoch and update the epoch if it has changed
+     * @return Current epoch
      */
-    function redemptionUsersForEpoch(uint256 epoch) external view returns (address[] memory) {
-        return redemptionUsersPerEpoch[epoch];
-    }
-
     function currentEpoch() external returns (uint256) {
         return _updateEpoch();
     }
 
+    /**
+     * @notice Get the last epoch update
+     * @return Last epoch update
+     */
     function lastEpochUpdate() external view returns (uint256) {
         return _vaultPosition.lastEpochUpdate;
     }
@@ -328,6 +415,14 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         return totalPendingSharesPerEpoch[epoch];
     }
 
+    function feeBasisPoints() external pure returns (uint256) {
+        return FEE_BASIS_POINTS;
+    }
+
+    function rewardsSplit() external view returns (uint256, uint256) {
+        return (rewardsSplitHolders, rewardsSplitLp);
+    }
+
     /**
      * @notice Convenience function to preview the amount of PENDLE that can be redeemed for the given shares according to the current values
      * @param shares Amount of shares to redeem
@@ -339,21 +434,30 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
 
     /// =========== Governance Council Functions ================ ///
 
-    function setFeeSwitch(bool enabled) public onlyRoles(ADMIN_ROLE) {
-        feeSwitchIsEnabled = enabled;
-        emit FeeSwitchSet(enabled);
-    }
-
-    function setFeeBasisPoints(uint256 basisPoints) public onlyRoles(ADMIN_ROLE) {
-        if (basisPoints > 1000) revert InvalidFeeBasisPoints();
-        feeBasisPoints = basisPoints;
-        emit FeeBasisPointsSet(basisPoints);
-    }
-
     function setFeeReceiver(address _feeReceiver) public onlyRoles(ADMIN_ROLE) {
         if (_feeReceiver == address(0)) revert InvalidFeeReceiver(); // 0 address is not allowed
         feeReceiver = _feeReceiver;
         emit FeeReceiverSet(feeReceiver);
+    }
+
+    function setLpFeeReceiver(address _lpFeeReceiver) public onlyRoles(ADMIN_ROLE) {
+        if (_lpFeeReceiver == address(0)) revert InvalidFeeReceiver(); // 0 address is not allowed
+        lpFeeReceiver = _lpFeeReceiver;
+        emit LpFeeReceiverSet(lpFeeReceiver);
+    }
+
+    function setFeeToken(address _feeToken) public onlyRoles(ADMIN_ROLE) {
+        feeToken = _feeToken;
+        emit FeeTokenSet(feeToken);
+    }
+
+    /**
+     * @notice Vote on a proposal on in the voting controller
+     * @param pools Pools to vote on
+     * @param weights Weights for each pool
+     */
+    function vote(address[] calldata pools, uint64[] calldata weights) public onlyRoles(ADMIN_ROLE) {
+        votingController.vote(pools, weights);
     }
 
     function setEpochDuration(uint128 _duration) public onlyRoles(TIMELOCK_CONTROLLER_ROLE) {
@@ -363,9 +467,11 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         emit EpochDurationSet(_duration);
     }
 
-    function setRewardsSplit(uint256 _rewardsSplit) public onlyRoles(TIMELOCK_CONTROLLER_ROLE) {
-        if (_rewardsSplit > 100) revert InvalidRewardsSplit();
-        rewardsSplit = _rewardsSplit;
+    function setRewardsSplit(uint256 holders, uint256 lp) public onlyRoles(TIMELOCK_CONTROLLER_ROLE) {
+        if (holders + lp > 1e18) revert InvalidrewardsSplit();
+        rewardsSplitHolders = holders;
+        rewardsSplitLp = lp;
+        emit rewardsSplitSet(holders, lp);
     }
 
     function setOwner(address _owner) public onlyOwner {
@@ -383,13 +489,13 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
     /// =========== Internal Functions ================ ///
 
     function _requireNextEpoch() internal view {
-        if (_calculateEpoch(block.timestamp) != _calculateEpoch(_vaultPosition.currentEpochStart) + 1) {
+        if (block.timestamp < _vaultPosition.currentEpochStart + _vaultPosition.epochDuration) {
             revert EpochNotEnded();
         }
     }
 
     function _requireIsWithinRedemptionWindow() internal view {
-        if (block.timestamp > _vaultPosition.currentEpochStart + _vaultPosition.preLockRedemptionPeriod) {
+        if (!_isWithinRedemptionWindow()) {
             revert OutsideRedemptionWindow();
         }
     }
@@ -424,7 +530,7 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         if (balanceOf(user) < shares) revert InsufficientBalance();
 
         uint256 currentPendingRedemptionShares = getUserAvailableRedemption(user);
-        if (currentPendingRedemptionShares == 0) return 0;
+        if (currentPendingRedemptionShares == 0) revert NoPendingRedemption();
 
         // assert that the user has enough pending redemption shares
         if (currentPendingRedemptionShares < shares) revert InsufficientShares();
@@ -436,18 +542,34 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         // redeem shares
         uint256 amountRedeemed = super.redeem(shares, user, user);
 
-        if (amountRedeemed != shares) revert InvalidRedemption();
-        emit RedemptionProcessed(user, shares);
+        emit RedemptionProcessed(user, shares, amountRedeemed);
 
         return amountRedeemed;
     }
 
     function _lockPendle(uint256 amount, uint128 duration) internal {
-        if (amount > totalSupply()) revert InvalidPendleBalance();
+        // Ensure sufficient unlocked PENDLE in the vault to lock
+        if (amount > SafeTransferLib.balanceOf(address(asset()), address(this))) revert InvalidPendleBalance();
         SafeTransferLib.safeApprove(address(asset()), address(votingEscrowMainchain), amount);
         votingEscrowMainchain.increaseLockPosition(_safeCast128(amount), duration);
         _vaultPosition.totalLockedPendle += amount;
         emit AssetPositionIncreased(amount, _vaultPosition.currentEpoch, duration);
+    }
+
+    /**
+     * @notice Receive stPENDLE from destination chain
+     * @dev since tokens can only get to other chains by bridging from this contract we should
+     * always have locked shares equivalent to the amount of stPENDLE that has been bridged
+     */
+    function _ccipReceive(Client.Any2EVMMessage memory message) internal override onlyRouter {
+        if (crossChainGatewayByChainId[message.sourceChainSelector] == address(0)) revert InvalidCrossChainGateway();
+
+        BridgeStPendleData memory bridgeData = abi.decode(message.data, (BridgeStPendleData));
+
+        // send shares locked in this contract to receiver
+        SafeTransferLib.safeTransfer(asset(), bridgeData.receiver, bridgeData.amount);
+
+        emit CrossChainMint(message.sourceChainSelector, bridgeData.sender, bridgeData.receiver, bridgeData.amount);
     }
 
     function _safeCast128(uint256 value) internal pure returns (uint128) {
@@ -466,6 +588,10 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
         emit Paused(_paused);
     }
 
+    function _beforeFirstEpoch() internal view {
+        if (_vaultPosition.currentEpoch != 0) revert InvalidEpoch();
+    }
+
     // ERC 4626 overrides
 
     function totalAssets() public view override returns (uint256) {
@@ -474,25 +600,40 @@ contract stPENDLE is ERC4626, OwnableRoles, ReentrancyGuard, ISTPENDLE {
 
     /**
      * @notice Preview the amount of PENDLE that can be redeemed for the given shares according to the current redemption snapshot
+     * @dev Will return 0 if redemption window has closed or if a new epoch has not been started
      * @param shares Amount of shares to redeem
      * @return Amount of PENDLE that can be redeemed
      */
     function previewRedeem(uint256 shares) public view override returns (uint256) {
+        // epoch has not been updated, return 0
+        if (_calculateEpoch(block.timestamp) != _vaultPosition.currentEpoch) return 0;
+        if (!_isWithinRedemptionWindow()) return 0;
+
         RedemptionSnapshot memory redemptionSnapshot = redemptionSnapshotPerEpoch[_vaultPosition.currentEpoch];
+        // if no snapshot exists, return 0
         if (redemptionSnapshot.totalSupplyAtEpochStart == 0) return 0;
         return FixedPointMathLib.fullMulDiv(
-            shares, redemptionSnapshot.aumPendleAtEpochStart, redemptionSnapshot.totalSupplyAtEpochStart
+            shares, redemptionSnapshot.aumPendleAtEpochStart + 1, redemptionSnapshot.totalSupplyAtEpochStart + 1
         );
     }
 
+    /**
+     * @notice override to revert so redeeming happens through redemption queue
+     */
     function redeem(uint256, /*shares */ address, /*to */ address /*owner*/ ) public pure override returns (uint256) {
         revert InvalidERC4626Function(); // this should never be called on this contract
     }
 
+    /**
+     * @notice override to revert so minting happens through deposit flow
+     */
     function mint(uint256, /*shares*/ address /*to*/ ) public pure override returns (uint256) {
         revert InvalidERC4626Function();
     }
 
+    /**
+     * @notice override to revert so withdrawals happen through withdrawal queue
+     */
     function withdraw(uint256, /*assets*/ address, /*to*/ address /*owner*/ ) public pure override returns (uint256) {
         revert InvalidERC4626Function();
     }

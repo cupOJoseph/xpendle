@@ -5,7 +5,4 @@ pragma solidity ^0.8.26;
 
 interface IPVotingController {
     function vote(address[] calldata pools, uint64[] calldata weights) external;
-    function applyPoolSlopeChanges(address pool) external;
-    function finalizeEpoch() external;
-    function broadcastResults(uint64 chainId) external payable;
 }
